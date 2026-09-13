@@ -1,0 +1,93 @@
+---
+title: "onboarding_GROWL"
+author: "Mike Steele"
+format: html
+---
+
+## On Boarding Project for GROWL
+
+What this notebook is doing A population synthesis simulation is exactly what it sounds like: instead of evolving one binary star, we evolve \*millions\* of them, each with a different initial mass, separation, metallicity, and so on. COMPAS is the code that does this. The output is a catalog (here, an HDF5 file) where \*\*each row is one simulated binary\*\* and each column is a property of that binary at some stage of its life. I'm loading the \`BSE_Double_Compact_Objects\` table — the subset of the population that ended its life as two compact objects (black holes and/or neutron stars) rather than as two ordinary stars or a merged single object. The \`mixture_weight\` column is the key one. It is \*\*not\*\* a count of physical systems — it's the statistical weight each simulated binary carries when we rescale the simulated population to a realistic one. One row in the file can stand in for thousands (or a fraction of one) real binaries in the universe. Everything I plot from here on is weighted by it; unweighted plots of a population synthesis catalog are misleading.
+
+```{r}
+library(rhdf5)
+library(dplyr)
+library(ggplot2)
+
+```
+
+I read the `BSE_Double_Compact_Objects` group out of the HDF5 file and coerce it to a data frame, then rename the columns into shorter names and derive a few quantities I'll need later: the primary and secondary masses (`m1 = max(M1, M2)`, `m2 = min(M1, M2)`), the mass ratio `q`, total mass, chirp mass, and a flag `is_BBH` that is true when both compact objects are black holes.
+
+```{r}
+
+h5_file <- "C:/GROWL_data/COMPAS_Output_wWeights.h5"
+
+# --- Load DCO table ---
+dco <- h5read(h5_file, "BSE_Double_Compact_Objects") %>% as.data.frame()
+
+dco <- dco %>%
+  mutate(
+    M1_raw = Mass.1., M2_raw = Mass.2.,
+    type1 = Stellar_Type.1., type2 = Stellar_Type.2.,
+    merges = Merges_Hubble_Time,
+    t_coal_Myr = Coalescence_Time,
+    t_form_Myr = Time,
+    Z = Metallicity.ZAMS.1.,
+    n_CE = CE_Event_Counter,
+    w = mixture_weight,
+    m1 = pmax(M1_raw, M2_raw),
+    m2 = pmin(M1_raw, M2_raw),
+    q  = m2/m1,
+    Mtot = m1 + m2,
+    Mchirp = (m1*m2)^0.6 / Mtot^0.2,
+    is_BBH = (type1 == 14 & type2 == 14)
+  )
+```
+
+### Census: rows vs. weights — why the two disagree 
+
+Before plotting anything, I want to show that rows and weights are not the same thing. Grouping by the types of the two compact objects (BH+BH, BH+NS, NS+NS) and summing both the raw row count and the sum of `mixture_weight`: - **BH+BH** dominates by row count (\~90%) and is still the largest by weight (\~79%), but the two numbers are different. - **NS+NS** is *negligible* by row count (\~0.2%) yet carries **\~13% of the total weight** — over 60× more weight than its raw share. That last row is the whole point of statistical weights. NS+NS systems form from a narrow slice of initial conditions, so COMPAS draws relatively few of them, but that slice of parameter space is *dense* in real systems. If I plotted unweighted histograms, I would badly under-represent double neutron stars and badly over-represent double black holes. Every plot below uses `weight = w`.
+
+```{r}
+# --- Census: rows vs weights ---
+wtot <- sum(dco$w)
+dco %>% group_by(type = case_when(
+  type1==14 & type2==14 ~ "BH+BH",
+  (type1==14 & type2==13) | (type1==13 & type2==14) ~ "BH+NS",
+  type1==13 & type2==13 ~ "NS+NS")) %>%
+  summarise(rows=n(), raw_pct=100*n()/nrow(dco),
+            weighted=sum(w), weighted_pct=100*sum(w)/wtot)
+
+
+# --- Merging BBHs ---
+bbh <- dco %>% filter(is_BBH, merges == 1)
+
+# ---  1D mass distribution ---
+bbh %>% filter(m1 > 0) %>% 
+  ggplot(aes(x=m1, weight=w)) +
+  geom_histogram(aes(y=after_stat(density)), bins=100, fill="grey85", colour="grey60") +
+  scale_y_log10() + scale_x_continuous(limits=c(0,52)) +
+  labs(x=expression(m[1]*" [M"*symbol("\260")*"]"), y="density") +
+  theme_minimal()
+
+# ---  reconstruct separation (Peters 1964) ---
+G_SI<-6.67430e-11; C_SI<-2.99792458e8; MSUN<-1.98892e30
+RSUN<-6.957e8; MYR<-3.15576e13
+
+bbh <- bbh %>% mutate(
+  a_Rsun = ((256/5)*G_SI^3*(m1*MSUN)*(m2*MSUN)*((m1+m2)*MSUN)*
+              (t_coal_Myr*MYR)/C_SI^5)^0.25 / RSUN,
+  log_a = log10(a_Rsun),
+  channel = ifelse(n_CE >= 1, "Common envelope", "Stable mass transfer")
+)
+
+# --- Two islands, split by channel ---
+bbh %>%
+  filter(log_a > 0.2, log_a < 1.9, q > 0.05, q < 1.02) %>%
+  ggplot(aes(x=log_a, y=q)) +
+  geom_hex(aes(weight=w), bins=60) +
+  scale_fill_viridis_c(trans="log10") +
+  facet_wrap(~channel) +
+  labs(x=expression(log[10]*"(a / R"[sun]*")"),
+       y=expression("q = m"[2]*"/m"[1])) +
+  theme_minimal()
+```
