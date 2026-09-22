@@ -1,0 +1,230 @@
+---
+title: "Predicting the Delay Time of Double Compact Object Binaries"
+author: Mike Steele
+format: typst
+execute:
+  cache: true
+---
+
+# Introduction
+
+To understand the eventual merger of binary systems, an essential first step is to quantify the time required for a pair of stars to evolve into a binary of compact objects (black holes or neutron stars). This analysis aims to answer the question: **How do initial stellar masses and orbital separation determine the delay time of a binary system?**
+
+The outcome modeled here is the **delay time** — the time from zero-age main sequence (ZAMS) to the merger of the two compact objects — for a population of 500 simulated binary black hole systems drawn from the GROWL catalog (Broekgaarden et al., 2024). Each row of the dataset is one independent binary system, with initial (ZAMS) masses, initial orbital separation, metallicity, and delay time recorded.
+
+```{r setup}
+#| include: false
+knitr::opts_knit$set(root.dir = "C:/Users/joels/OneDrive/DATA SELECTION AND INITIAL EXPLORATION")
+library(brms)
+library(ggplot2)
+library(dplyr)
+library(bayesplot)
+library(car)
+```
+
+# Data prep: 500-system DCO population
+
+```{r data-prep}
+df <- read.csv("growl_dco_population_500.csv") %>%
+  rename(
+    Mass1      = zams_mass_1,
+    Mass2      = zams_mass_2,
+    Separation = zams_separation_rsun,
+    DelayTime  = delay_time_myr
+  )
+summary(df)
+```
+
+The population consists of 500 BH–BH binaries (stellar types 14/14). Delay times span roughly 10 Myr to 13.2 Gyr (median ≈ 210 Myr), a heavily right-skewed distribution — a fact that will motivate the log-outcome model below.
+
+# Check Collinearity
+
+```{r vif}
+vif(lm(DelayTime ~ Mass1 + Mass2 + Separation, data = df))
+vif(lm(DelayTime ~ log(Mass1) + log(Mass2) + log(Separation), data = df))
+```
+
+VIF diagnostics indicate minimal collinearity among predictors (all VIF < 3), reflecting that initial masses and separation are independent properties of the simulated population. Coefficients can be interpreted individually without the attribution ambiguity that plagued the earlier single-trajectory analysis, where VIF reached ≈ 165 because predictors co-evolved with time within one system.
+
+# Model Set-Up
+
+```{r model-setup}
+my_priors <- c(
+  prior(normal(0, 5), class = "Intercept"),
+  prior(normal(0, 1), class = "b"),
+  prior(exponential(1), class = "sigma")
+)
+
+fit_model <- function(formula, data = df, seed = 42) {
+  brm(
+    formula = formula,
+    data    = data,
+    family  = gaussian(),
+    prior   = my_priors,
+    chains  = 4,
+    iter    = 2000,
+    warmup  = 1000,
+    cores   = 1,   # parallel chains hung silently on this machine
+    seed    = seed,
+    refresh = 100
+  )
+}
+```
+
+Weakly informative priors were used: normal(0, 5) for the intercept, normal(0, 1) for coefficients, and exponential(1) for the residual standard deviation. The results were robust to prior choice.
+
+# Candidate models
+
+Four candidate specifications are fit: three on the raw delay-time scale (linear, log-log, and a mass-ratio formulation), and one with a log-transformed outcome.
+
+```{r fit-models}
+#| results: hide
+#| message: false
+#| warning: false
+
+# Linear
+model_linear <- fit_model(DelayTime ~ Mass1 + Mass2 + Separation, seed = 42)
+
+# Log-log (log predictors, raw outcome)
+model_loglog <- fit_model(DelayTime ~ log(Mass1) + log(Mass2) + log(Separation), seed = 42)
+
+# Ratio
+model_ratio <- fit_model(DelayTime ~ I(Mass2/Mass1) + Mass1 + log(Separation), seed = 42)
+
+# Log-outcome (preferred)
+model_logout <- fit_model(
+  log(DelayTime) ~ log(Mass1) + log(Mass2) + log(Separation),
+  seed = 42
+)
+
+# Save fitted models so knit doesn't re-run Stan
+saveRDS(model_linear, "model_linear.rds")
+saveRDS(model_loglog, "model_loglog.rds")
+saveRDS(model_ratio,  "model_ratio.rds")
+saveRDS(model_logout, "model_logout.rds")
+```
+
+# Summary of Models
+
+```{r summaries}
+summary(model_linear)
+summary(model_loglog)
+summary(model_ratio)
+summary(model_logout)
+```
+
+All models converged successfully, with all Rhat values equal to 1.00, indicating that the Markov chains mixed well and the posterior estimates are reliable.
+
+Two patterns are apparent. On the raw scale, no predictor shows a credible effect — every 95% credible interval includes zero — and residual scatter is enormous (σ ≈ 1,395 Myr), reflecting the extreme right-skew of delay times. The log-outcome model tells a different story: it achieves a well-calibrated residual scale on the log scale (σ = 1.82 in log-Myr) and reveals a clear, positive effect of initial orbital separation (β = 0.33, 95% CI [0.19, 0.46]).
+
+# Model Comparison: Leave-One-Out Cross-Validation (LOO-CV)
+
+```{r loo}
+loo_compare(list(
+  linear = loo(model_linear),
+  loglog = loo(model_loglog),
+  ratio  = loo(model_ratio)
+))
+```
+
+| Model | Specification | ΔELPD (vs. best) | SE |
+|:---|:---|:---:|:---:|
+| **Linear** | DelayTime ~ Mass1 + Mass2 + Separation | 0.0 | — |
+| Ratio | DelayTime ~ I(Mass2/Mass1) + Mass1 + log(Separation) | −0.1 | 2.4 |
+| Log-log | DelayTime ~ log(Mass1) + log(Mass2) + log(Separation) | −0.8 | 3.5 |
+
+The three raw-scale models are statistically indistinguishable (ΔELPD < 1 with SE 2.4–3.5), consistent with the flat credible intervals above: on the raw scale, none of these formulations extracts signal from the noise. The log-outcome model (`model_logout`) is excluded from this comparison because its outcome is on a different scale — ELPD values are not comparable across outcome transformations. It is instead justified by its posterior predictive performance and its scientifically meaningful, well-identified coefficients, shown next.
+
+# Visuals: Diagnostics and Plots
+
+```{r best-model}
+best_model <- model_logout
+```
+
+## Convergence (Rhat = 1.00 expected)
+
+```{r trace-plots}
+plot(best_model,
+     variable = c("b_Intercept", "b_logMass1", "b_logMass2", "b_logSeparation", "sigma"))
+```
+
+## Posterior predictive check
+
+```{r ppc}
+pp_check(best_model, ndraws = 100) + ggtitle("Posterior Predictive Check (log scale)")
+```
+
+On the log scale, the simulated replicate densities track the observed log-delay-time distribution well: the model reproduces both the central location and the overall spread. The observed distribution shows a mild shoulder near log-delay ≈ 4–5 and slightly more mass in the upper tail (log-delay ≈ 8–10) than the symmetric Gaussian-in-logs implies — a residual shape mismatch that motivates the non-Gaussian extensions discussed below. Crucially, the raw-scale models' posterior predictive checks (not shown) fail badly here, straddling the near-zero spike and the 13 Gyr tail simultaneously.
+
+## Coefficient plot (bayesplot)
+
+```{r mcmc-intervals}
+mcmc_intervals(as_draws_array(best_model),
+               pars = c("b_Intercept", "b_logMass1", "b_logMass2", "b_logSeparation"))
+```
+
+## Conditional effects
+
+```{r conditional-effects}
+plot(conditional_effects(best_model,
+                         effects = c("Mass1", "Mass2", "Separation")))
+```
+
+Unlike the raw-scale fits, where conditional-effect lines were flat (all intervals cross zero), the log-outcome model shows a clear positive relationship between initial separation and delay time, with mass effects small and uncertain by comparison.
+
+## Coefficient plot (ggplot)
+
+```{r coef-plot}
+coef_summary <- summary(best_model)$fixed
+coef_data <- data.frame(
+  Predictor = rownames(coef_summary),
+  Estimate  = coef_summary[, "Estimate"],
+  Lower     = coef_summary[, "l-95% CI"],
+  Upper     = coef_summary[, "u-95% CI"]
+) %>% filter(Predictor != "Intercept")
+
+ggplot(coef_data, aes(x = Estimate, y = Predictor)) +
+  geom_point(size = 4, color = "darkblue") +
+  geom_errorbar(aes(xmin = Lower, xmax = Upper), width = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
+  labs(
+    title = "Regression Coefficients with 95% Credible Intervals",
+    x     = "Estimate (log-Myr per unit change)",
+    y     = "Predictor"
+  ) +
+  theme_minimal()
+```
+
+Only `logSeparation`'s credible interval excludes zero; both mass intervals straddle zero comfortably.
+
+# Discussion
+
+The initial analysis of a single BSE trajectory suggested strong effects of initial masses on formation time. However, that approach conflated time with mass — as the simulation progresses, time increases while masses evolve, creating an artificial correlation. When applied to a population of 500 independent binary systems, the results are markedly different.
+
+On the raw scale, no predictor shows a credible effect (all 95% credible intervals include zero), and residual scatter is enormous (σ ≈ 1,400 Myr). This reflects the extreme right-skew of delay times, which range from 10 Myr to over 13 Gyr.
+
+When the outcome is log-transformed, structure emerges. Initial orbital separation is the one clear predictor (β = 0.33, 95% CI [0.19, 0.46]): doubling the initial separation multiplies the delay time by approximately 1.26, consistent with the expectation that wider binaries require longer to undergo interaction and inspiral. Initial masses show weak, non-credible effects (logMass1: β = 0.36, CI [−0.14, 0.87]; logMass2: β = −0.19, CI [−0.66, 0.30]).
+
+The contrast with the single-trajectory analysis is instructive: what appeared to be a dominant secondary-mass effect (β = −20.69) was an artifact of regressing time on co-evolving properties within one system. On independent systems with genuinely varying initial conditions, that effect disappears. Collinearity diagnostics support this interpretation: VIF values fell from ≈ 165 (single trajectory) to < 3 (population data).
+
+These findings carry a cautionary message for population-synthesis inference: delay-time predictions from initial conditions are dominated by orbital separation in this population, and mass-based predictions from single-system trajectories can be strongly misleading.
+
+# Summation
+
+This analysis used Bayesian regression to model delay times for 500 simulated double compact object (BH–BH) binaries from the GROWL catalog, with one row per system and initial (ZAMS) masses and separation as predictors.
+
+Key findings from the preferred log-outcome model (log DelayTime ~ log Mass1 + log Mass2 + log Separation):
+
+- log(Separation) = 0.33 [0.19, 0.46]: doubling the initial separation multiplies delay time by ≈ 1.26
+- log(Mass1) = 0.36 [−0.14, 0.87]: weak positive, not credible
+- log(Mass2) = −0.19 [−0.66, 0.30]: not credible
+
+All models converged (Rhat = 1.00). Raw-scale models were indistinguishable by LOO-CV (ΔELPD < 1 with SE 2.4–3.5) and showed no credible effects due to the extreme skew of delay times (10 Myr – 13 Gyr); the log-outcome model resolved the separation effect and achieved a well-calibrated residual scale (σ = 1.82 in log-Myr).
+
+An important methodological finding: an earlier version of this analysis fit the same model family to a single BSE trajectory (3,951 time-ordered snapshots of one system) and found strong apparent mass effects. Those effects were artifacts — the predictors co-evolve with time within a single system, so the model fit the trajectory rather than the relationship between initial conditions and outcomes. The population-level analysis shows that only initial separation credibly predicts delay time in this dataset.
+
+Future work should extend to larger GROWL populations as the catalog becomes publicly available, incorporate metallicity and eccentricity (available in the example dataset), and test non-Gaussian likelihoods (e.g., lognormal or hurdle models) for the delay-time distribution.
+
+# References
+
+Broekgaarden, F., et al. (2024). GROWL: GRavitational-Wave paLeontoLogy. GitHub. https://github.com/FloorBroekgaarden/GROWL-catalog-public
